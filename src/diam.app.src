@@ -1,0 +1,18 @@
+{application, diam,
+ [{description, "Diameter relay application"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications,
+   [kernel,
+    stdlib
+   ]},
+  %% hex.pm stuff
+  {licenses, ["Apache-2.0"]},
+  {links, [{"GitHub", "https://github.com/sebastiw/diam"}]},
+  {files, [%% directories
+           "src",
+           %% files
+           "rebar.config"]},
+  {exclude_patterns, [
+                     ]}
+ ]}.

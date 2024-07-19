@@ -98,13 +98,7 @@ handle_event(enter, OldState, NewState, Data) ->
 
 %% ----- closed -----
 handle_event(_, connect_init, closed, #{mode := client} = Data) ->
-  TProc = maps:get(transport_proc, Data),
-  Host = maps:get(local_host, Data),
-  Realm = maps:get(local_realm, Data),
-  LocalIPs = maps:get(local_ip_addresses, Data),
-  HBH = maps:get(hbh, Data),
-  E2E = maps:get(e2e, Data),
-  diam_sctp:send_msg(TProc, diam_msgs:cer(Host, Realm, HBH, E2E, LocalIPs)),
+  send_cer(Data),
   {next_state, wait_for_cea, Data, [{{timeout, capability_exchange}, ?CAPABILITY_TIMER, retry}]};
 handle_event(_, connect_init, closed, #{mode := server} = Data) ->
   {next_state, wait_for_cer, Data};
@@ -113,31 +107,13 @@ handle_event(_, {connect_fail, _Reason}, closed, _Data) ->
 
 %% ----- wait_for_cer -----
 handle_event(_, {receive_msg, ?CER, Bin}, wait_for_cer, Data) ->
-  TProc = maps:get(transport_proc, Data),
-  CER = diam_msgs:decode(?CER, Bin),
-  OHPat = maps:get(allowed_host_pattern, Data),
-  ORPat = maps:get(allowed_realm_pattern, Data),
-  [{true, OH}] = maps:get('Origin-Host', CER),
-  [{true, OR}] = maps:get('Origin-Realm', CER),
-  MOH = re:run(OH, OHPat, [{capture, none}]),
-  MOR = re:run(OR, ORPat, [{capture, none}]),
-  case match == MOH andalso match == MOR of
-    true ->
-      Host = maps:get(local_host, Data),
-      Realm = maps:get(local_realm, Data),
-      LocalIPs = maps:get(local_ip_addresses, Data),
-      HBH = maps:get(hbh, Data),
-      E2E = maps:get(e2e, Data),
-      diam_sctp:send_msg(TProc, diam_msgs:cea(Host, Realm, HBH, E2E, LocalIPs, 2001)),
+  case test_cer(Data, Bin) of
+    {true, CER} ->
+      send_cea(Data, 2001),
       NewData = Data#{peer => CER},
       {next_state, open, NewData};
-    false ->
-      Host = maps:get(local_host, Data),
-      Realm = maps:get(local_realm, Data),
-      LocalIPs = maps:get(local_ip_addresses, Data),
-      HBH = maps:get(hbh, Data),
-      E2E = maps:get(e2e, Data),
-      diam_sctp:send_msg(TProc, diam_msgs:cea(Host, Realm, HBH, E2E, LocalIPs, 3003)),
+    {false, _} ->
+      send_cea(Data, 3003),
       {keep_state_and_data, [{{timeout, capability_exchange}, ?CAPABILITY_TIMER, giveup}]}
   end;
 handle_event({timeout, capability_exchange}, retry, wait_for_cer, Data) ->
@@ -146,33 +122,21 @@ handle_event({timeout, capability_exchange}, retry, wait_for_cer, Data) ->
 
 %% ----- wait_for_cea -----
 handle_event(_, {receive_msg, ?CEA, Bin}, wait_for_cea, Data) ->
-  CEA = diam_msgs:decode(?CEA, Bin),
-  OHPat = maps:get(allowed_host_pattern, Data),
-  ORPat = maps:get(allowed_realm_pattern, Data),
-  [{true, OH}] = maps:get('Origin-Host', CEA),
-  [{true, OR}] = maps:get('Origin-Realm', CEA),
-  MOH = re:run(OH, OHPat, [{capture, none}]),
-  MOR = re:run(OR, ORPat, [{capture, none}]),
-  [{true, <<ResultCode:32>>}] = maps:get('Result-Code', CEA),
-  case {ResultCode, match == MOH andalso match == MOR} of
-    {2001, true} ->
+  case test_cea(Data, Bin) of
+    {true, CEA} ->
       NewData = Data#{peer => CEA},
       {next_state, open, NewData, [{{timeout, capability_exchange}, cancel}]};
-    _ ->
-      io:format("~p:~p:~p nomatch ~p ~p ~p~n", [?MODULE, ?FUNCTION_NAME, ?LINE, ResultCode, MOH, MOR]),
+    {_, CEA} ->
+      io:format("~p:~p:~p nomatch ~p~n", [?MODULE, ?FUNCTION_NAME, ?LINE, CEA]),
       {keep_state_and_data, [{{timeout, capability_exchange}, ?CAPABILITY_TIMER, retry}]}
   end;
 handle_event({timeout, capability_exchange}, retry, wait_for_cea, Data) ->
-  %% Abort?
-  TProc = maps:get(transport_proc, Data),
-  Host = maps:get(local_host, Data),
-  Realm = maps:get(local_realm, Data),
-  LocalIPs = maps:get(local_ip_addresses, Data),
-  HBH = maps:get(hbh, Data),
-  E2E = maps:get(e2e, Data),
-  diam_sctp:send_msg(TProc, diam_msgs:cer(Host, Realm, HBH, E2E, LocalIPs)),
+  %% Abort after X retries?
+  send_cer(Data),
   keep_state_and_data;
 
+handle_event(_, closed, open, Data) ->
+  {next_state, closed, Data#{peer => undefined}};
 handle_event(_, _, open, _Data) ->
   keep_state_and_data.
 
@@ -183,8 +147,45 @@ terminate(_Why, _State, _Data) ->
 %% Actions
 %% ---------------------------------------------------------------------------
 
+send_cer(Data) ->
+  TProc = maps:get(transport_proc, Data),
+  Host = maps:get(local_host, Data),
+  Realm = maps:get(local_realm, Data),
+  LocalIPs = maps:get(local_ip_addresses, Data),
+  HBH = maps:get(hbh, Data),
+  E2E = maps:get(e2e, Data),
+  diam_sctp:send_msg(TProc, diam_msgs:cer(Host, Realm, HBH, E2E, LocalIPs)).
+
+send_cea(Data, ResultCode) ->
+  TProc = maps:get(transport_proc, Data),
+  Host = maps:get(local_host, Data),
+  Realm = maps:get(local_realm, Data),
+  LocalIPs = maps:get(local_ip_addresses, Data),
+  HBH = maps:get(hbh, Data),
+  E2E = maps:get(e2e, Data),
+  diam_sctp:send_msg(TProc, diam_msgs:cea(Host, Realm, HBH, E2E, LocalIPs, ResultCode)).
 
 %% ---------------------------------------------------------------------------
 %% Help functions
 %% ---------------------------------------------------------------------------
 
+test_cer(Data, Bin) ->
+  CER = diam_msgs:decode(?CER, Bin),
+  OHPat = maps:get(allowed_host_pattern, Data),
+  ORPat = maps:get(allowed_realm_pattern, Data),
+  [{true, OH}] = maps:get('Origin-Host', CER),
+  [{true, OR}] = maps:get('Origin-Realm', CER),
+  MOH = re:run(OH, OHPat, [{capture, none}]),
+  MOR = re:run(OR, ORPat, [{capture, none}]),
+  {match == MOH andalso match == MOR, CER}.
+
+test_cea(Data, Bin) ->
+  CEA = diam_msgs:decode(?CEA, Bin),
+  OHPat = maps:get(allowed_host_pattern, Data),
+  ORPat = maps:get(allowed_realm_pattern, Data),
+  [{true, OH}] = maps:get('Origin-Host', CEA),
+  [{true, OR}] = maps:get('Origin-Realm', CEA),
+  MOH = re:run(OH, OHPat, [{capture, none}]),
+  MOR = re:run(OR, ORPat, [{capture, none}]),
+  [{true, <<ResultCode:32>>}] = maps:get('Result-Code', CEA),
+  {2001 =:= ResultCode andalso match == MOH andalso match == MOR, CEA}.

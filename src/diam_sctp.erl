@@ -168,8 +168,13 @@ handle_event(_, {send_msg, Msg}, open, Data) ->
   Child = maps:get(child_proc, Data),
   diam_sctp_child:send_msg(Child, Msg),
   keep_state_and_data;
-handle_event(_, {control_msg, closed}, open, _Data) ->
-  {stop, closed};
+handle_event(_, {control_msg, closed}, open, Data) ->
+  case maps:get(mode, Data) of
+    client ->
+      {next_state, connect, Data, [{next_event, internal, start}]};
+    server ->
+      {next_state, listen, Data, [{next_event, internal, start}]}
+  end;
 handle_event(_, {receive_msg, RawMsg}, open, Data) ->
   Caller = maps:get(peer_proc, Data),
   Msgs = maps:get(iov, RawMsg),
@@ -211,7 +216,8 @@ set_sctp_sndrcvinfo(Sock, SndRcvInfo) ->
                     16#0000:16, %% one of these 16-bits shouldn't exist?
                     PPID:32,
                     Context:32, %% used for abort/error reporting
-                    TTL:32,
+                    TTL:32, %% socket-process should be able to write to socket
+                            %% within TTL, otherwise discard msg.
                     16#0000_0000:32,
                     16#0000_0000:32,
                     16#0000_0000:32>>,
@@ -227,86 +233,3 @@ handle_received_msgs(Caller, [Msg|Msgs]) ->
       diam_peer:receive_msg(Caller, DiamHead, Msg)
   end,
   handle_received_msgs(Caller, Msgs).
-
-%% ---------------------------------------------------------------------------
-%% Tight send/receive on socket
-%% ---------------------------------------------------------------------------
-
-%% spawn_child(Socket, Parent) ->
-%%   Child = spawn_link(fun () ->
-%%                            receive good_to_go ->
-%%                              loop(Socket, Parent)
-%%                            end
-%%                      end),
-%%   ok = socket:setopt(Socket, {otp, controlling_process}, Child),
-%%   Child ! good_to_go,
-%%   {ok, Child}.
-
-%% loop(Socket, Parent) ->
-%%   timer:sleep(1000),
-%%   case collect_send([]) of
-%%     {stop, Msgs} ->
-%%       send_msgs(Socket, Msgs),
-%%       ok = socket:setopt(Socket, {otp, controlling_process}, Parent),
-%%       stop;
-%%     [] ->
-%%       receive_msgs(Socket, Parent),
-%%       loop(Socket, Parent);
-%%     Msgs ->
-%%       send_msgs(Socket, Msgs),
-%%       receive_msgs(Socket, Parent),
-%%       loop(Socket, Parent)
-%%   end.
-
-%% collect_send(Acc) ->
-%%   receive
-%%     stop ->
-%%       {stop, Acc};
-%%     {send_msg, Msg} ->
-%%       collect_send([Msg|Acc])
-%%   after 0 ->
-%%     Acc
-%%   end.
-
-%% receive_msgs(Socket, Parent) ->
-%%   receive_msgs(Socket, Parent, 10).
-
-%% receive_msgs(_Socket, _Parent, 0) ->
-%%   ok;
-%% receive_msgs(Socket, Parent, Max) ->
-%%   Ref = make_ref(),
-%%   case socket:recvmsg(Socket, 0, 0, [], Ref) of
-%%     {ok, Msg} ->
-%%       receive_msg(Parent, Msg),
-%%       receive_msgs(Socket, Parent, Max-1);
-%%     {select, SelectInfo} ->
-%%       socket:cancel(Socket, SelectInfo);
-%%     {error, closed} ->
-%%       ok = socket:shutdown(Socket, read),
-%%       control_msg(Parent, closed),
-%%       ok;
-%%     {error, Err} ->
-%%       io:format("~p:~p:~p (~p)~n", [?MODULE, ?FUNCTION_NAME, ?LINE, Err]),
-%%       receive_msgs(Socket, Parent, Max-1)
-%%   end.
-
-%% send_msgs(_Socket, []) ->
-%%   ok;
-%% send_msgs(Socket, {Iov, SelectInfo}) ->
-%%   Ref = make_ref(),
-%%   case socket:sendmsg(Socket, Iov, SelectInfo, Ref) of
-%%     ok ->
-%%       ok;
-%%     {select, {SelectInfo2, RestData2}} ->
-%%       send_msgs(Socket, {RestData2, SelectInfo2});
-%%     {select, SelectInfo2} ->
-%%       ok = socket:cancel(Socket, SelectInfo2);
-%%     {error, {Err, RestData}} ->
-%%       io:format("~p:~p:~p (~p, ~p)~n", [?MODULE, ?FUNCTION_NAME, ?LINE, Err, RestData]),
-%%       ok;
-%%     {error, Err} ->
-%%       io:format("~p:~p:~p (~p)~n", [?MODULE, ?FUNCTION_NAME, ?LINE, Err]),
-%%       ok
-%%   end;
-%% send_msgs(Socket, Msgs) ->
-%%   send_msgs(Socket, {#{iov => Msgs}, []}).

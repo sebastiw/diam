@@ -94,7 +94,7 @@ receive_msgs(Socket, Parent, Max) ->
     {error, closed} ->
       ok = socket:shutdown(Socket, read),
       diam_sctp:control_msg(Parent, closed),
-      ok;
+      exit(normal);
     {error, Err} ->
       io:format("~p:~p:~p (~p)~n", [?MODULE, ?FUNCTION_NAME, ?LINE, Err]),
       receive_msgs(Socket, Parent, Max-1)

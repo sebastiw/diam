@@ -52,16 +52,16 @@ handle_cast(good_to_go, State) ->
   io:format("~p:~p:~p~n", [?MODULE, good_to_go, ?LINE]),
   NewState = start_timeout(State),
   {noreply, NewState};
-handle_cast({send_msg, Msg}, #{socket := Socket} = State) ->
+handle_cast({send_msg, Msg}, #{socket := Socket, parent := Parent} = State) ->
   io:format("~p:~p:~p~n", [?MODULE, send_msg, ?LINE]),
-  send_msgs(Socket, [Msg]),
+  send_msgs(Socket, Parent, [Msg]),
   {noreply, State}.
 
 handle_info(stop, #{socket := Socket, parent := Parent} = State) ->
   ok = socket:setopt(Socket, {otp, controlling_process}, Parent),
   {stop, parent, State};
 handle_info({timeout, receive_loop}, #{socket := Socket, parent := Parent} = State) ->
-  io:format("~p:~p:~p~n", [?MODULE, timeout, ?LINE]),
+  io:format("~p:~p:~p~n", [?MODULE, receive_loop, ?LINE]),
   receive_msgs(Socket, Parent),
   NewState = start_timeout(State),
   {noreply, NewState}.
@@ -92,7 +92,11 @@ receive_msgs(Socket, Parent, Max) ->
     {select, SelectInfo} ->
       socket:cancel(Socket, SelectInfo);
     {error, closed} ->
-      ok = socket:shutdown(Socket, read),
+      shutdown(Socket),
+      diam_sctp:control_msg(Parent, closed),
+      exit(normal);
+    {error, econnreset} ->
+      shutdown(Socket),
       diam_sctp:control_msg(Parent, closed),
       exit(normal);
     {error, Err} ->
@@ -100,25 +104,35 @@ receive_msgs(Socket, Parent, Max) ->
       receive_msgs(Socket, Parent, Max-1)
   end.
 
-send_msgs(_Socket, []) ->
+send_msgs(_Socket, _Parent, []) ->
   ok;
-send_msgs(Socket, {Iov, SelectInfo}) ->
+send_msgs(Socket, Parent, {Iov, SelectInfo}) ->
   Ref = make_ref(),
   case socket:sendmsg(Socket, Iov, SelectInfo, Ref) of
     ok ->
       ok;
     {select, {SelectInfo2, RestData2}} ->
-      send_msgs(Socket, {RestData2, SelectInfo2});
+      send_msgs(Socket, Parent, {RestData2, SelectInfo2});
     {select, SelectInfo2} ->
       ok = socket:cancel(Socket, SelectInfo2);
     {error, {Err, RestData}} ->
       io:format("~p:~p:~p (~p, ~p)~n", [?MODULE, ?FUNCTION_NAME, ?LINE, Err, RestData]),
       ok;
+    {error, epipe} ->
+      shutdown(Socket),
+      diam_sctp:control_msg(Parent, closed),
+      exit(normal);
     {error, Err} ->
       io:format("~p:~p:~p (~p)~n", [?MODULE, ?FUNCTION_NAME, ?LINE, Err]),
       ok
   end;
-send_msgs(Socket, Msgs) ->
-  send_msgs(Socket, {#{iov => Msgs}, []}).
+send_msgs(Socket, Parent, Msgs) ->
+  send_msgs(Socket, Parent, {#{iov => Msgs}, []}).
 
-
+shutdown(Socket) ->
+  case socket:shutdown(Socket, read) of
+    ok ->
+      ok;
+    {error, closed} ->
+      ok
+  end.

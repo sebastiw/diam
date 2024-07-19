@@ -93,7 +93,7 @@ init_data(AllOpts, TPid) ->
 
 handle_event(enter, OldState, NewState, Data) ->
   Mode = maps:get(mode, Data),
-  io:format("~p:~p:~p enter ~p from ~p~n", [?MODULE, Mode, self(), NewState, OldState]),
+  io:format("~p:~p:~p state change ~p->~p~n", [?MODULE, Mode, self(), OldState, NewState]),
   keep_state_and_data;
 
 %% ----- closed -----
@@ -106,6 +106,8 @@ handle_event(_, {connect_fail, _Reason}, closed, _Data) ->
   keep_state_and_data;
 
 %% ----- wait_for_cer -----
+handle_event(_, closed, wait_for_cer, Data) ->
+  {next_state, closed, Data#{peer => undefined}, [{{timeout, capability_exchange}, cancel}]};
 handle_event(_, {receive_msg, ?CER, Bin}, wait_for_cer, Data) ->
   case test_cer(Data, Bin) of
     {true, CER} ->
@@ -121,6 +123,8 @@ handle_event({timeout, capability_exchange}, retry, wait_for_cer, Data) ->
   diam_sctp:stop(TProc);
 
 %% ----- wait_for_cea -----
+handle_event(_, closed, wait_for_cea, Data) ->
+  {next_state, closed, Data#{peer => undefined}, [{{timeout, capability_exchange}, cancel}]};
 handle_event(_, {receive_msg, ?CEA, Bin}, wait_for_cea, Data) ->
   case test_cea(Data, Bin) of
     {true, CEA} ->
@@ -135,8 +139,8 @@ handle_event({timeout, capability_exchange}, retry, wait_for_cea, Data) ->
   send_cer(Data),
   keep_state_and_data;
 
-handle_event(_, closed, open, Data) ->
-  {next_state, closed, Data#{peer => undefined}};
+handle_event(_, {connect_fail, _Reason}, open, Data) ->
+  {next_state, closed, Data#{peer => undefined}, []};
 handle_event(_, _, open, _Data) ->
   keep_state_and_data.
 

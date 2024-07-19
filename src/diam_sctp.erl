@@ -79,18 +79,16 @@ callback_mode() ->
 
 init(AllOpts) ->
   {ok, PPid} = diam_peer:start_link(AllOpts),
-  {ok, Sock} = socket:open(inet, stream, sctp),
-  Data = init_data(maps:get(transport_options, AllOpts), Sock, PPid),
-  bind_local_addr(Sock, Data),
-  set_sctp_sndrcvinfo(Sock, maps:get(sctp_sndrcvinfo, Data, #{})),
-  case maps:get(mode, Data) of
+  Data = init_data(maps:get(transport_options, AllOpts)),
+  NewData = new_socket(set_peer(Data, PPid)),
+  case maps:get(mode, NewData) of
     client ->
-      {ok, connect, Data, [{next_event, internal, start}]};
+      {ok, connect, NewData, [{next_event, internal, start}]};
     server ->
-      {ok, listen, Data, [{next_event, internal, start}]}
+      {ok, listen, NewData, [{next_event, internal, start}]}
   end.
 
-init_data(Opts, Sock, PPid) ->
+init_data(Opts) ->
   LIPAddrs = maps:get(local_ip_addresses, Opts, []),
   LPort = maps:get(local_port, Opts, 0),
   RIPAddrs = maps:get(remote_ip_addresses, Opts, []),
@@ -103,9 +101,7 @@ init_data(Opts, Sock, PPid) ->
     remote_ip_addresses => RIPAddrs,
     local_port => LPort,
     local_ip_addresses => LIPAddrs,
-    sctp_sndrcvinfo => SndRcvInfo,
-    socket => Sock,
-    peer_proc => PPid
+    sctp_sndrcvinfo => SndRcvInfo
   }.
 
 handle_event(enter, OldState, NewState, Data) ->
@@ -115,24 +111,21 @@ handle_event(enter, OldState, NewState, Data) ->
 
 %% ----- connect; client -----
 handle_event(_, start, connect, Data) ->
-  Caller = maps:get(peer_proc, Data),
   Sock = maps:get(socket, Data),
-  RemAddrs = maps:get(remote_ip_addresses, Data),
-  RemPort = maps:get(remote_port, Data),
-  Addrs = [#{family => inet, addr => IP, port => RemPort}
-           || IP <- RemAddrs],
-  case socket:connect(Sock, hd(Addrs), ?CONNECT_TIMEOUT) of
+  case connect(Data, Sock) of
     ok ->
-      diam_peer:connect_init(Caller),
-      {ok, Child} = diam_sctp_child:start_link(Sock, self()),
-      diam_sctp_child:give_control(Child, Sock),
-      %% {ok, Child} = spawn_child(Sock, self()),
-      {next_state, open, Data#{child_proc => Child}};
+      NewData = ack_and_start_child(Data, Sock),
+      {next_state, open, NewData};
     {error, timeout} ->
       {keep_state_and_data, [{next_event, internal, start}]};
     {error, econnrefused} ->
+      timer:sleep(?CONNECT_TIMEOUT),
       {keep_state_and_data, [{next_event, internal, start}]};
+    {error, closed} ->
+      NewData = new_socket(Data),
+      {keep_state, NewData, [{next_event, internal, start}]};
     {error, Err} ->
+      Caller = maps:get(peer_proc, Data),
       diam_peer:connect_fail(Caller, Err),
       keep_state_and_data
   end;
@@ -141,20 +134,15 @@ handle_event({timeout, connect}, _Info, connect, _Data) ->
 
 %% ----- listen; server -----
 handle_event(_, start, listen, Data) ->
-  Caller = maps:get(peer_proc, Data),
-  LSock = maps:get(socket, Data),
-  ok = socket:listen(LSock),
-  case socket:accept(LSock, ?CONNECT_TIMEOUT) of
+  case accept(Data, blocking) of
     {ok, Sock1} ->
       %% remote_ip_addresses && allowed_ip_subnet check
-      diam_peer:connect_init(Caller),
-      {ok, Child} = diam_sctp_child:start_link(Sock1, self()),
-      diam_sctp_child:give_control(Child, Sock1),
-      %% {ok, Child} = spawn_child(Sock1, self()),
-      {next_state, open, Data#{child_sockets => [Sock1], child_proc => Child}};
+      NewData = ack_and_start_child(Data, Sock1),
+      {next_state, open, NewData#{child_sockets => [Sock1]}};
     {error, timeout} ->
       {keep_state_and_data, [{next_event, internal, start}]};
     {error, Err} ->
+      Caller = maps:get(peer_proc, Data),
       diam_peer:connect_fail(Caller, Err),
       keep_state_and_data
   end;
@@ -169,6 +157,8 @@ handle_event(_, {send_msg, Msg}, open, Data) ->
   diam_sctp_child:send_msg(Child, Msg),
   keep_state_and_data;
 handle_event(_, {control_msg, closed}, open, Data) ->
+  Caller = maps:get(peer_proc, Data),
+  diam_peer:connect_fail(Caller, closed),
   case maps:get(mode, Data) of
     client ->
       {next_state, connect, Data, [{next_event, internal, start}]};
@@ -187,8 +177,48 @@ terminate(_Why, _State, Data) ->
   [socket:close(S) || S <- [Sock|Socks]].
 
 %% ---------------------------------------------------------------------------
+%% Actions
+%% ---------------------------------------------------------------------------
+
+connect(Data, Sock) ->
+  RemAddrs = maps:get(remote_ip_addresses, Data),
+  RemPort = maps:get(remote_port, Data),
+  Addrs = [#{family => inet, addr => IP, port => RemPort}
+           || IP <- RemAddrs],
+  socket:connect(Sock, hd(Addrs), ?CONNECT_TIMEOUT).
+
+accept(Data, blocking) ->
+  LSock = maps:get(socket, Data),
+  %% If LSock have died, socket:listen returns {error,closed}
+  ok = socket:listen(LSock),
+  socket:accept(LSock, ?CONNECT_TIMEOUT).
+
+ack_and_start_child(Data, Sock) ->
+  Caller = maps:get(peer_proc, Data),
+  diam_peer:connect_init(Caller),
+  {ok, Child} = diam_sctp_child:start_link(Sock, self()),
+  diam_sctp_child:give_control(Child, Sock),
+  Data#{child_proc => Child}.
+
+%% ---------------------------------------------------------------------------
 %% Help functions
 %% ---------------------------------------------------------------------------
+
+new_socket(Data) ->
+  {ok, Sock} = socket:open(inet, stream, sctp),
+  bind_local_addr(Sock, Data),
+  set_sctp_sndrcvinfo(Sock, maps:get(sctp_sndrcvinfo, Data, #{})),
+  set_sock(Data, Sock).
+
+set_peer(Data, PPid) ->
+  Data#{
+    peer_proc => PPid
+    }.
+
+set_sock(Data, Sock) ->
+  Data#{
+    socket => Sock
+    }.
 
 bind_local_addr(Sock, Opts) ->
   LIPAddrs = maps:get(local_ip_addresses, Opts),

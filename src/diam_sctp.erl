@@ -5,12 +5,12 @@ SCTP state machine
 
 -behaviour(gen_statem).
 
--export([start_link/0,
-         start_link/1,
+-export([start_link/1,
          start_link/2,
-         control_msg/2,
-         receive_msg/2,
+         control_msg/3,
+         receive_msg/3,
          send_msg/2,
+         send_msg/3,
          stop/1
         ]).
 
@@ -19,6 +19,9 @@ SCTP state machine
          handle_event/4,
          terminate/3
         ]).
+
+-include_lib("diameter/include/diameter.hrl").
+-define(IS_APPL_0, #diameter_header{version = 1, application_id = 0}).
 
 -define(CONNECT_TIMEOUT, 1500).
 
@@ -33,41 +36,28 @@ SCTP state machine
 %% API
 %% ---------------------------------------------------------------------------
 
-start_link() ->
-  start_link(?MODULE).
-
--spec start_link(name() | opts()) -> '_'.
+-spec start_link(opts()) -> '_'.
 start_link(Opts) when is_map(Opts) ->
   TOpts = maps:get(transport_options, Opts, #{}),
-  start_link(maps:get(name, TOpts, ?MODULE), Opts);
-start_link(SCTPName) when is_atom(SCTPName) ->
-  Opts = #{
-    transport_options => #{
-      peer_proc => self(),
-      mode => server,
-      local_port => 3868,
-      local_ip_addresses => ["127.0.0.1"]
-      }
-    },
-  start_link(SCTPName, Opts).
+  start_link(maps:get(name, TOpts, ?MODULE), Opts).
 
+-spec start_link(name(), opts()) -> '_'.
 start_link(SCTPName, Opts) ->
   gen_statem:start_link({local, SCTPName}, ?MODULE, Opts, []).
 
-control_msg(SProc, Msg) ->
-  io:format("~p:~p:~p (~p)~n", [?MODULE, SProc, ?FUNCTION_NAME, Msg]),
-  gen_statem:cast(SProc, {control_msg, Msg}).
+control_msg(SProc, Socket, Msg) ->
+  gen_statem:cast(SProc, {control_msg, Socket, Msg}).
 
-receive_msg(SProc, Msg) ->
-  io:format("~p:~p:~p (~p)~n", [?MODULE, SProc, ?FUNCTION_NAME, Msg]),
-  gen_statem:cast(SProc, {receive_msg, Msg}).
+receive_msg(SProc, Socket, Msg) ->
+  gen_statem:cast(SProc, {receive_msg, Socket, Msg}).
 
 send_msg(SProc, Msg) ->
-  io:format("~p:~p:~p (~p)~n", [?MODULE, SProc, ?FUNCTION_NAME, Msg]),
   gen_statem:cast(SProc, {send_msg, Msg}).
 
+send_msg(SProc, Socket, Msg) ->
+  gen_statem:cast(SProc, {send_msg, Socket, Msg}).
+
 stop(SProc) ->
-  io:format("~p:~p:~p~n", [?MODULE, SProc, ?FUNCTION_NAME]),
   gen_statem:stop(SProc).
 
 %% ---------------------------------------------------------------------------
@@ -78,9 +68,8 @@ callback_mode() ->
   [handle_event_function, state_enter].
 
 init(AllOpts) ->
-  {ok, PPid} = diam_peer:start_link(AllOpts),
-  Data = init_data(maps:get(transport_options, AllOpts)),
-  NewData = new_socket(set_peer(Data, PPid)),
+  Data = init_data(AllOpts),
+  NewData = new_socket(Data),
   case maps:get(mode, NewData) of
     client ->
       {ok, connect, NewData, [{next_event, internal, start}]};
@@ -88,7 +77,8 @@ init(AllOpts) ->
       {ok, listen, NewData, [{next_event, internal, start}]}
   end.
 
-init_data(Opts) ->
+init_data(AllOpts) ->
+  Opts = maps:get(transport_options, AllOpts),
   LIPAddrs = maps:get(local_ip_addresses, Opts, []),
   LPort = maps:get(local_port, Opts, 0),
   RIPAddrs = maps:get(remote_ip_addresses, Opts, []),
@@ -101,7 +91,8 @@ init_data(Opts) ->
     remote_ip_addresses => RIPAddrs,
     local_port => LPort,
     local_ip_addresses => LIPAddrs,
-    sctp_sndrcvinfo => SndRcvInfo
+    sctp_sndrcvinfo => SndRcvInfo,
+    all_options => AllOpts
   }.
 
 handle_event(enter, OldState, NewState, Data) ->
@@ -125,8 +116,8 @@ handle_event(_, start, connect, Data) ->
       NewData = new_socket(Data),
       {keep_state, NewData, [{next_event, internal, start}]};
     {error, Err} ->
-      Caller = maps:get(peer_proc, Data),
-      diam_peer:connect_fail(Caller, Err),
+      Peer = get_peer(Data, Sock),
+      diam_peer:connect_fail(Peer, Sock, Err),
       keep_state_and_data
   end;
 handle_event({timeout, connect}, _Info, connect, _Data) ->
@@ -134,17 +125,18 @@ handle_event({timeout, connect}, _Info, connect, _Data) ->
 
 %% ----- listen; server -----
 handle_event(_, start, listen, Data) ->
-  case accept(Data, blocking) of
+  case accept(Data, ?CONNECT_TIMEOUT) of
     {ok, Sock1} ->
       %% remote_ip_addresses && allowed_ip_subnet check
       NewData = ack_and_start_child(Data, Sock1),
-      {next_state, open, NewData#{child_sockets => [Sock1]}};
+      {ok, TRef} = timer:send_after(?CONNECT_TIMEOUT, {accept_timeout, nowait}),
+      {next_state, open, NewData#{accept_tref => TRef}};
     {error, timeout} ->
+      io:format("~p:~p:~p~n", [?MODULE, accept_timeout, self()]),
       {keep_state_and_data, [{next_event, internal, start}]};
     {error, Err} ->
-      Caller = maps:get(peer_proc, Data),
-      diam_peer:connect_fail(Caller, Err),
-      keep_state_and_data
+      io:format("~p:~p:~p ~p~n", [?MODULE, accept_error, self(), Err]),
+      {keep_state_and_data, [{next_event, internal, start}]}
   end;
 handle_event({timeout, connect}, Info, listen, Data) ->
   LSock = maps:get(socket, Data),
@@ -153,27 +145,61 @@ handle_event({timeout, connect}, Info, listen, Data) ->
 
 %% ----- wait for local peer -----
 handle_event(_, {send_msg, Msg}, open, Data) ->
-  Child = maps:get(child_proc, Data),
+  CS = maps:to_list(maps:get(child_sockets, Data)),
+  Random = rand:uniform(length(CS)),
+  {_, Child} = lists:nth(Random, CS),
   diam_sctp_child:send_msg(Child, Msg),
   keep_state_and_data;
-handle_event(_, {control_msg, closed}, open, Data) ->
-  Caller = maps:get(peer_proc, Data),
-  diam_peer:connect_fail(Caller, closed),
+handle_event(_, {send_msg, Socket, Msg}, open, Data) ->
+  CS = maps:get(child_sockets, Data),
+  Child = maps:get(Socket, CS),
+  diam_sctp_child:send_msg(Child, Msg),
+  keep_state_and_data;
+handle_event(_, {control_msg, Sock, closed}, open, Data) ->
+  AcceptTRef = maps:get(accept_tref, Data, undefined),
+  timer:cancel(AcceptTRef),
+  Peer = get_peer(Data, Sock),
+  diam_peer:connect_fail(Peer, Sock, closed),
   case maps:get(mode, Data) of
     client ->
       {next_state, connect, Data, [{next_event, internal, start}]};
     server ->
       {next_state, listen, Data, [{next_event, internal, start}]}
   end;
-handle_event(_, {receive_msg, RawMsg}, open, Data) ->
-  Caller = maps:get(peer_proc, Data),
+handle_event(_, {receive_msg, Socket, RawMsg}, open, Data) ->
+  Peer = get_peer(Data, Socket),
   Msgs = maps:get(iov, RawMsg),
-  handle_received_msgs(Caller, Msgs),
-  keep_state_and_data.
+  handle_received_msgs({Peer, Socket}, Msgs),
+  keep_state_and_data;
+handle_event(info, {accept_timeout, Select}, open, Data) ->
+  {ok, cancel} = timer:cancel(maps:get(accept_tref, Data)),
+  case accept(Data, Select) of
+    {ok, Sock1} ->
+      NewData = ack_and_start_child(Data, Sock1),
+      {ok, TRef} = timer:send_after(?CONNECT_TIMEOUT, {accept_timeout, nowait}),
+      {keep_state, NewData#{accept_tref => TRef}};
+    {select, {select_info, accept, SelectInfo}} ->
+      {ok, TRef} = timer:send_after(?CONNECT_TIMEOUT, {accept_timeout, SelectInfo}),
+      {keep_state, Data#{accept_tref => TRef}};
+    {error, Reason} ->
+      io:format("~p:~p:~p ~p~n", [?MODULE, accept_timeout, self(), Reason]),
+      {ok, TRef} = timer:send_after(?CONNECT_TIMEOUT, {accept_timeout, nowait}),
+      {keep_state, Data#{accept_tref => TRef}}
+  end;
+handle_event(info, {'$socket', LSock, select, Ref}, open, #{socket := LSock} = Data) ->
+  {ok, cancel} = timer:cancel(maps:get(accept_tref, Data)),
+  case accept(Data, Ref) of
+    {ok, Sock1} ->
+      NewData = ack_and_start_child(Data, Sock1),
+      {ok, TRef} = timer:send_after(?CONNECT_TIMEOUT, {accept_timeout, nowait}),
+      {keep_state, NewData#{accept_tref => TRef}}
+  end;
+handle_event(info, {'$socket', Sock, abort, {_Ref, cancelled}}, open, #{socket := Sock} = Data) ->
+  {keep_state, Data}.
 
 terminate(_Why, _State, Data) ->
   Sock = maps:get(socket, Data),
-  Socks = maps:get(child_sockets, Data, []),
+  Socks = maps:keys(maps:get(child_sockets, Data, #{})),
   [socket:close(S) || S <- [Sock|Socks]].
 
 %% ---------------------------------------------------------------------------
@@ -187,18 +213,21 @@ connect(Data, Sock) ->
            || IP <- RemAddrs],
   socket:connect(Sock, hd(Addrs), ?CONNECT_TIMEOUT).
 
-accept(Data, blocking) ->
+accept(Data, Timeout) when is_integer(Timeout) ->
   LSock = maps:get(socket, Data),
   %% If LSock have died, socket:listen returns {error,closed}
   ok = socket:listen(LSock),
-  socket:accept(LSock, ?CONNECT_TIMEOUT).
+  socket:accept(LSock, ?CONNECT_TIMEOUT);
+accept(Data, Ref) ->
+  LSock = maps:get(socket, Data),
+  socket:accept(LSock, Ref).
 
 ack_and_start_child(Data, Sock) ->
-  Caller = maps:get(peer_proc, Data),
-  diam_peer:connect_init(Caller),
+  PPid = get_or_start_peer(Data),
   {ok, Child} = diam_sctp_child:start_link(Sock, self()),
   diam_sctp_child:give_control(Child, Sock),
-  Data#{child_proc => Child}.
+  diam_peer:connect_init(PPid, Sock),
+  add_peer(Data, Sock, PPid, Child).
 
 %% ---------------------------------------------------------------------------
 %% Help functions
@@ -210,10 +239,25 @@ new_socket(Data) ->
   set_sctp_sndrcvinfo(Sock, maps:get(sctp_sndrcvinfo, Data, #{})),
   set_sock(Data, Sock).
 
-set_peer(Data, PPid) ->
+add_peer(Data, Sock, PPid, Child) ->
+  PProcs = maps:get(peer_procs, Data, #{}),
+  Children = maps:get(child_sockets, Data, #{}),
   Data#{
-    peer_proc => PPid
+    peer_procs => PProcs#{Sock => PPid},
+    child_sockets => Children#{Sock => Child}
     }.
+
+get_peer(Data, Socket) ->
+  PProcs = maps:get(peer_procs, Data),
+  maps:get(Socket, PProcs).
+
+get_or_start_peer(Data) ->
+  case diam_peer:start_link(maps:get(all_options, Data)) of
+    {ok, PPid} ->
+      PPid;
+    {error, {already_started, PPId}} ->
+      PPId
+  end.
 
 set_sock(Data, Sock) ->
   Data#{
@@ -255,11 +299,15 @@ set_sctp_sndrcvinfo(Sock, SndRcvInfo) ->
 
 handle_received_msgs(_, []) ->
   ok;
-handle_received_msgs(Caller, [Msg|Msgs]) ->
+handle_received_msgs({Peer, Socket}, [Msg|Msgs]) ->
   case diameter_codec:decode_header(Msg) of
     false ->
+      io:format("Not diameter ~p~n", [Msg]),
       ok;
+    ?IS_APPL_0 = DiamHead ->
+      diam_peer:receive_msg(Peer, Socket, DiamHead, Msg);
     DiamHead ->
-      diam_peer:receive_msg(Caller, DiamHead, Msg)
+      %% Callback/other process?
+      io:format("Not implemented ~p~n", [DiamHead])
   end,
-  handle_received_msgs(Caller, Msgs).
+  handle_received_msgs({Peer, Socket}, Msgs).

@@ -25,7 +25,7 @@
 %% ---------------------------------------------------------------------------
 
 start_link(Socket, Parent) ->
-  gen_server:start_link({local, ?MODULE}, ?MODULE, [Socket, Parent], []).
+  gen_server:start_link(?MODULE, [Socket, Parent], []).
 
 give_control(Child, Socket) ->
   ok = socket:setopt(Socket, {otp, controlling_process}, Child),
@@ -61,7 +61,6 @@ handle_info(stop, #{socket := Socket, parent := Parent} = State) ->
   ok = socket:setopt(Socket, {otp, controlling_process}, Parent),
   {stop, parent, State};
 handle_info({timeout, receive_loop}, #{socket := Socket, parent := Parent} = State) ->
-  io:format("~p:~p:~p~n", [?MODULE, receive_loop, ?LINE]),
   receive_msgs(Socket, Parent),
   NewState = start_timeout(State),
   {noreply, NewState}.
@@ -87,21 +86,21 @@ receive_msgs(Socket, Parent, Max) ->
   case socket:recvmsg(Socket, 0, 0, [], Ref) of
     {ok, Msg} ->
       io:format("~p:~p:~p ~p~n", [?MODULE, socket, ?LINE, Msg]),
-      diam_sctp:receive_msg(Parent, Msg),
+      diam_sctp:receive_msg(Parent, Socket, Msg),
       receive_msgs(Socket, Parent, Max-1);
     {select, SelectInfo} ->
       socket:cancel(Socket, SelectInfo);
     {error, closed} ->
       shutdown(Socket),
-      diam_sctp:control_msg(Parent, closed),
+      diam_sctp:control_msg(Parent, Socket, closed),
       exit(normal);
     {error, econnreset} ->
       shutdown(Socket),
-      diam_sctp:control_msg(Parent, closed),
+      diam_sctp:control_msg(Parent, Socket, closed),
       exit(normal);
     {error, Err} ->
-      io:format("~p:~p:~p (~p)~n", [?MODULE, ?FUNCTION_NAME, ?LINE, Err]),
-      receive_msgs(Socket, Parent, Max-1)
+      io:format("~p:~p:~p:~p (~p, ~p)~n", [?MODULE, ?FUNCTION_NAME, ?LINE, self(), Err, socket:info(Socket)]),
+      receive_msgs(Socket, Parent, 0)
   end.
 
 send_msgs(_Socket, _Parent, []) ->
@@ -120,7 +119,7 @@ send_msgs(Socket, Parent, {Iov, SelectInfo}) ->
       ok;
     {error, epipe} ->
       shutdown(Socket),
-      diam_sctp:control_msg(Parent, closed),
+      diam_sctp:control_msg(Parent, Socket, closed),
       exit(normal);
     {error, Err} ->
       io:format("~p:~p:~p (~p)~n", [?MODULE, ?FUNCTION_NAME, ?LINE, Err]),

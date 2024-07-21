@@ -5,12 +5,11 @@ Diameter Peer State Machine
 
 -behaviour(gen_statem).
 
--export([start_link/0,
-         start_link/1,
+-export([start_link/1,
          start_link/2,
-         connect_init/1,
-         connect_fail/2,
-         receive_msg/3
+         connect_init/2,
+         connect_fail/3,
+         receive_msg/4
         ]).
 
 -export([callback_mode/0,
@@ -29,36 +28,25 @@ Diameter Peer State Machine
 %% API
 %% ---------------------------------------------------------------------------
 
-start_link() ->
-  start_link(?MODULE).
-
 start_link(Opts) when is_map(Opts) ->
   POpts = maps:get(peer_options, Opts, #{}),
-  start_link(maps:get(name, POpts, ?MODULE), Opts);
-start_link(PeerName) when is_atom(PeerName) ->
-  Opts = #{
-    peer_options => #{
-      local_host => "my.domain.com",
-      local_realm => "domain.com"
-      }
-    },
-  start_link(PeerName, Opts).
+  start_link(maps:get(name, POpts, ?MODULE), Opts).
 
 start_link(PeerName, Opts) ->
   TProc = self(),
   gen_statem:start_link({local, PeerName}, ?MODULE, Opts#{transport_proc => TProc}, []).
 
-connect_init(PProc) ->
-  io:format("~p:~p:~p~n", [?MODULE, PProc, ?FUNCTION_NAME]),
-  gen_statem:cast(PProc, connect_init).
+connect_init(PProc, TRef) ->
+  io:format("~p:~p:~p<->~p~n", [?MODULE, ?FUNCTION_NAME, PProc, TRef]),
+  gen_statem:cast(PProc, {connect_init, TRef}).
 
-connect_fail(PProc, Reason) ->
-  io:format("~p:~p:~p (~p)~n", [?MODULE, PProc, ?FUNCTION_NAME, Reason]),
-  gen_statem:cast(PProc, {connect_fail, Reason}).
+connect_fail(PProc, TRef, Reason) ->
+  io:format("~p:~p:~p<->~p (~p)~n", [?MODULE, ?FUNCTION_NAME, PProc, TRef, Reason]),
+  gen_statem:cast(PProc, {connect_fail, TRef, Reason}).
 
-receive_msg(PProc, Header, Bin) ->
-  io:format("~p:~p:~p (~p)~n", [?MODULE, PProc, ?FUNCTION_NAME, Header]),
-  gen_statem:cast(PProc, {receive_msg, Header, Bin}).
+receive_msg(PProc, TRef, Header, Bin) ->
+  io:format("~p:~p:~p<->~p (~p)~n", [?MODULE, ?FUNCTION_NAME, PProc, TRef, Header]),
+  gen_statem:cast(PProc, {receive_msg, TRef, Header, Bin}).
 
 %% ---------------------------------------------------------------------------
 %% State machine
@@ -68,12 +56,12 @@ callback_mode() ->
   [handle_event_function, state_enter].
 
 init(AllOpts) ->
-  TPid = maps:get(transport_proc, AllOpts),
-  Data = init_data(AllOpts, TPid),
+  Data = init_data(AllOpts),
   {ok, closed, Data}.
 
-init_data(AllOpts, TPid) ->
+init_data(AllOpts) ->
   Opts = maps:get(peer_options, AllOpts),
+  TProc = maps:get(transport_proc, AllOpts),
   TOpts = maps:get(transport_options, AllOpts),
   {ok, HostMP} = re:compile(maps:get(allowed_host_pattern, Opts, <<".*">>)),
   {ok, RealmMP} = re:compile(maps:get(allowed_realm_pattern, Opts, <<".*">>)),
@@ -81,14 +69,14 @@ init_data(AllOpts, TPid) ->
   LIPAddrs = maps:get(local_ip_addresses, TOpts, []),
   #{
     mode => Mode,
-    transport_proc => TPid,
     allowed_host_pattern => HostMP,
     allowed_realm_pattern => RealmMP,
     local_host => maps:get(local_host, Opts),
     local_realm => maps:get(local_realm, Opts),
     local_ip_addresses => LIPAddrs,
     hbh => 0,
-    e2e => 0
+    e2e => 0,
+    transport_proc => TProc
     }.
 
 handle_event(enter, OldState, NewState, Data) ->
@@ -97,51 +85,93 @@ handle_event(enter, OldState, NewState, Data) ->
   keep_state_and_data;
 
 %% ----- closed -----
-handle_event(_, connect_init, closed, #{mode := client} = Data) ->
-  send_cer(Data),
-  {next_state, wait_for_cea, Data, [{{timeout, capability_exchange}, ?CAPABILITY_TIMER, retry}]};
-handle_event(_, connect_init, closed, #{mode := server} = Data) ->
-  {next_state, wait_for_cer, Data};
-handle_event(_, {connect_fail, _Reason}, closed, _Data) ->
-  keep_state_and_data;
+handle_event(_, {connect_init, TRef}, closed, #{mode := client} = Data) ->
+  send_cer(TRef, Data),
+  NewData = add_connecting_peer(Data, TRef),
+  {next_state, wait_for_ce, NewData, [{{timeout, capability_exchange}, ?CAPABILITY_TIMER, {retry, TRef}}]};
+handle_event(_, {connect_init, TRef}, closed, #{mode := server} = Data) ->
+  NewData = add_connecting_peer(Data, TRef),
+  {next_state, wait_for_ce, NewData};
+handle_event(_, {connect_fail, TRef, _Reason}, closed, Data) ->
+  %% Can we even get to this state?
+  NewData = remove_peer(Data, TRef),
+  {keep_state, NewData};
 
-%% ----- wait_for_cer -----
-handle_event(_, closed, wait_for_cer, Data) ->
-  {next_state, closed, Data#{peer => undefined}, [{{timeout, capability_exchange}, cancel}]};
-handle_event(_, {receive_msg, ?CER, Bin}, wait_for_cer, Data) ->
+%% ----- wait_for_ce -----
+handle_event(_, {receive_msg, TRef, ?CER, Bin}, wait_for_ce, #{mode := server} = Data) ->
   case test_cer(Data, Bin) of
     {true, CER} ->
-      send_cea(Data, 2001),
-      NewData = Data#{peer => CER},
-      {next_state, open, NewData};
+      send_cea(TRef, Data, 2001),
+      NewData = add_active_peer(Data, TRef, CER),
+      {next_state, open, NewData, [{{timeout, capability_exchange}, cancel}]};
     {false, _} ->
-      send_cea(Data, 3003),
-      {keep_state_and_data, [{{timeout, capability_exchange}, ?CAPABILITY_TIMER, giveup}]}
+      send_cea(TRef, Data, 3003),
+      {keep_state_and_data, [{{timeout, capability_exchange}, ?CAPABILITY_TIMER, {retry, TRef}}]}
   end;
-handle_event({timeout, capability_exchange}, retry, wait_for_cer, Data) ->
-  TProc = maps:get(transport_proc, Data),
-  diam_sctp:stop(TProc);
-
-%% ----- wait_for_cea -----
-handle_event(_, closed, wait_for_cea, Data) ->
-  {next_state, closed, Data#{peer => undefined}, [{{timeout, capability_exchange}, cancel}]};
-handle_event(_, {receive_msg, ?CEA, Bin}, wait_for_cea, Data) ->
+handle_event(_, {receive_msg, TRef, ?CEA, Bin}, wait_for_ce, #{mode := client} = Data) ->
   case test_cea(Data, Bin) of
     {true, CEA} ->
-      NewData = Data#{peer => CEA},
+      NewData = add_active_peer(Data, TRef, CEA),
       {next_state, open, NewData, [{{timeout, capability_exchange}, cancel}]};
     {_, CEA} ->
       io:format("~p:~p:~p nomatch ~p~n", [?MODULE, ?FUNCTION_NAME, ?LINE, CEA]),
-      {keep_state_and_data, [{{timeout, capability_exchange}, ?CAPABILITY_TIMER, retry}]}
+      {keep_state_and_data, [{{timeout, capability_exchange}, ?CAPABILITY_TIMER, {retry, TRef}}]}
   end;
-handle_event({timeout, capability_exchange}, retry, wait_for_cea, Data) ->
-  %% Abort after X retries?
-  send_cer(Data),
-  keep_state_and_data;
+handle_event(_, {connect_init, TRef}, wait_for_ce, #{mode := client} = Data) ->
+  send_cer(TRef, Data),
+  NewData = add_connecting_peer(Data, TRef),
+  {keep_state, NewData};
+handle_event(_, {connect_init, TRef}, wait_for_ce, #{mode := server} = Data) ->
+  NewData = add_connecting_peer(Data, TRef),
+  {keep_state, NewData};
 
-handle_event(_, {connect_fail, _Reason}, open, Data) ->
-  {next_state, closed, Data#{peer => undefined}, []};
-handle_event(_, _, open, _Data) ->
+handle_event({timeout, capability_exchange}, {retry, TRef}, wait_for_ce, #{mode := server} = _Data) ->
+  {keep_state_and_data, [{{timeout, capability_exchange}, ?CAPABILITY_TIMER, {retry, TRef}}]};
+handle_event({timeout, capability_exchange}, {retry, TRef}, wait_for_ce, #{mode := client} = Data) ->
+  %% Abort after X retries?
+  send_cer(TRef, Data),
+  NewData = add_connecting_peer(Data, TRef),
+  {keep_state, NewData, [{{timeout, capability_exchange}, ?CAPABILITY_TIMER, {retry, TRef}}]};
+
+%% ----- open -----
+handle_event(_, {connect_fail, TRef, _Reason}, open, Data) ->
+  NewData = remove_peer(Data, TRef),
+  case {maps:get(active_peers, NewData, []), maps:get(connecting_peers, NewData, [])} of
+    {[], []} ->
+      {next_state, closed, NewData, []};
+    {[], _} ->
+      {next_state, wait_for_ce, NewData, []};
+    {_, _} ->
+      {keep_state, NewData}
+  end;
+handle_event(_, {connect_init, TRef}, open, #{mode := client} = Data) ->
+  send_cer(TRef, Data),
+  NewData = add_connecting_peer(Data, TRef),
+  {keep_state, NewData};
+handle_event(_, {connect_init, TRef}, open, #{mode := server} = Data) ->
+  NewData = add_connecting_peer(Data, TRef),
+  {keep_state, NewData};
+handle_event(_, {receive_msg, TRef, ?CER, Bin}, open, #{mode := server} = Data) ->
+  case test_cer(Data, Bin) of
+    {true, CER} ->
+      send_cea(TRef, Data, 2001),
+      NewData = add_active_peer(Data, TRef, CER),
+      {keep_state, NewData};
+    {false, _} ->
+      send_cea(TRef, Data, 3003),
+      keep_state_and_data
+  end;
+handle_event(_, {receive_msg, TRef, ?CEA, Bin}, open, #{mode := client} = Data) ->
+  case test_cea(Data, Bin) of
+    {true, CEA} ->
+      NewData = add_active_peer(Data, TRef, CEA),
+      {keep_state, open, NewData};
+    {_, CEA} ->
+      io:format("~p:~p:~p nomatch ~p~n", [?MODULE, ?FUNCTION_NAME, ?LINE, CEA]),
+      keep_state_and_data
+  end;
+handle_event(_, Event, open, _Data) ->
+  io:format("~p:~p:~p ~p~n", [?MODULE, open, ?LINE, Event]),
   keep_state_and_data.
 
 terminate(_Why, _State, _Data) ->
@@ -151,23 +181,23 @@ terminate(_Why, _State, _Data) ->
 %% Actions
 %% ---------------------------------------------------------------------------
 
-send_cer(Data) ->
+send_cer(TRef, Data) ->
   TProc = maps:get(transport_proc, Data),
   Host = maps:get(local_host, Data),
   Realm = maps:get(local_realm, Data),
   LocalIPs = maps:get(local_ip_addresses, Data),
   HBH = maps:get(hbh, Data),
   E2E = maps:get(e2e, Data),
-  diam_sctp:send_msg(TProc, diam_msgs:cer(Host, Realm, HBH, E2E, LocalIPs)).
+  diam_sctp:send_msg(TProc, TRef, diam_msgs:cer(Host, Realm, HBH, E2E, LocalIPs)).
 
-send_cea(Data, ResultCode) ->
+send_cea(TRef, Data, ResultCode) ->
   TProc = maps:get(transport_proc, Data),
   Host = maps:get(local_host, Data),
   Realm = maps:get(local_realm, Data),
   LocalIPs = maps:get(local_ip_addresses, Data),
   HBH = maps:get(hbh, Data),
   E2E = maps:get(e2e, Data),
-  diam_sctp:send_msg(TProc, diam_msgs:cea(Host, Realm, HBH, E2E, LocalIPs, ResultCode)).
+  diam_sctp:send_msg(TProc, TRef, diam_msgs:cea(Host, Realm, HBH, E2E, LocalIPs, ResultCode)).
 
 %% ---------------------------------------------------------------------------
 %% Help functions
@@ -193,3 +223,14 @@ test_cea(Data, Bin) ->
   MOR = re:run(OR, ORPat, [{capture, none}]),
   [{true, <<ResultCode:32>>}] = maps:get('Result-Code', CEA),
   {2001 =:= ResultCode andalso match == MOH andalso match == MOR, CEA}.
+
+remove_peer(Data0, TRef) ->
+  Data1 = maps:update_with(active_peers, fun (APs) -> lists:keydelete(TRef, 1, APs) end, [], Data0),
+  maps:update_with(connecting_peers, fun (APs) -> APs -- [TRef] end, [], Data1).
+
+add_active_peer(Data0, TRef, CE) ->
+  Data1 = remove_peer(Data0, TRef),
+  maps:update_with(active_peers, fun (APs) -> [{TRef, CE}|APs] end, [{TRef, CE}], Data1).
+
+add_connecting_peer(Data, TRef) ->
+  maps:update_with(connecting_peers, fun (APs) -> [TRef|APs] end, [TRef], Data).

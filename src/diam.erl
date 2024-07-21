@@ -18,6 +18,12 @@ start_client() ->
     },
   diam_sctp:start_link(normalize_config(Opts)).
 
+send_server(Msg) ->
+  diam_sctp:send_msg(transport_server, Msg).
+
+send_client(Msg) ->
+  diam_sctp:send_msg(transport_client, Msg).
+
 normalize_config(Opts) ->
   TOpts0 = maps:get(transport_options, Opts),
   TOpts1 = maps:update_with(local_ip_addresses, fun parse_ip_addrs/1, [], TOpts0),

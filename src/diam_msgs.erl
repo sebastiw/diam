@@ -13,8 +13,7 @@
         ]).
 
 -include_lib("diameter/include/diameter.hrl").
--define(CER, #diameter_header{version = 1, application_id = 0, cmd_code = 257, is_request = true}).
--define(CEA, #diameter_header{version = 1, application_id = 0, cmd_code = 257, is_request = false}).
+-include_lib("diam/include/diam.hrl").
 
 -define(PAD_LEN(Len), (8*((4 - ((Len) rem 4)) rem 4))).
 -define(ZERO_PAD(ByteLen), 0:?PAD_LEN(ByteLen)).
@@ -49,7 +48,13 @@ decode(?CEA, Msg) ->
     'Supported-Vendor-Id' => maps:get({0, 265}, AVPMap),
     'Auth-Application-Id' => maps:get({0, 258}, AVPMap),
     'Acct-Application-Id' => maps:get({0, 259}, AVPMap)
-    }.
+    };
+decode(?DWR, Msg) ->
+  AVPMap = decode(Msg),
+  #{
+    'Origin-Host' => maps:get({0, 264}, AVPMap),
+    'Origin-Realm' => maps:get({0, 296}, AVPMap),
+    };
 
 decode(<<_Header:20/binary, Data/binary>>) ->
   AVPs = decode_avps(Data, []),

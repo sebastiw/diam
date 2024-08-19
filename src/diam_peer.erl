@@ -9,7 +9,8 @@ Diameter Peer State Machine
          start_link/2,
          connect_init/2,
          connect_fail/3,
-         receive_msg/4
+         receive_msg/4,
+         send_dwr_msg/2
         ]).
 
 -export([callback_mode/0,
@@ -46,6 +47,9 @@ connect_fail(PProc, TRef, Reason) ->
 receive_msg(PProc, TRef, Header, Bin) ->
   io:format("~p:~p:~p<->~p (~p)~n", [?MODULE, ?FUNCTION_NAME, PProc, TRef, Header]),
   gen_statem:cast(PProc, {receive_msg, TRef, Header, Bin}).
+
+send_dwr_msg(PProc, TRef) ->
+    gen_statem:cast(PProc, {send_dwr, TRef}).
 
 %% ---------------------------------------------------------------------------
 %% State machine
@@ -178,6 +182,9 @@ handle_event(_, {receive_msg, TRef, ?DWR, Bin}, open, Data) ->
       send_dwa(TRef, Data, 3003),
       keep_state_and_data
   end;
+handle_event(_, {send_dwr, TRef}, open, Data) ->
+    send_dwr(TRef, Data),
+    keep_state_and_data;
 handle_event(_, Event, open, _Data) ->
   io:format("~p:~p:~p ~p~n", [?MODULE, open, ?LINE, Event]),
   keep_state_and_data.

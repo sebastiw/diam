@@ -53,8 +53,8 @@ decode(?DWR, Msg) ->
   AVPMap = decode(Msg),
   #{
     'Origin-Host' => maps:get({0, 264}, AVPMap),
-    'Origin-Realm' => maps:get({0, 296}, AVPMap),
-    };
+    'Origin-Realm' => maps:get({0, 296}, AVPMap)
+    }.
 
 decode(<<_Header:20/binary, Data/binary>>) ->
   AVPs = decode_avps(Data, []),

@@ -168,8 +168,9 @@ handle_event(_, {control_msg, Sock, closed}, open, Data) ->
   end;
 handle_event(_, {receive_msg, Socket, RawMsg}, open, Data) ->
   Peer = get_peer(Data, Socket),
+  WdPid = get_wd(Peer, Data),
   Msgs = maps:get(iov, RawMsg),
-  handle_received_msgs({Peer, Socket}, Msgs),
+  handle_received_msgs({Peer, Socket, WdPid}, Msgs),
   keep_state_and_data;
 handle_event(info, {accept_timeout, Select}, open, Data) ->
   {ok, cancel} = timer:cancel(maps:get(accept_tref, Data)),
@@ -224,10 +225,15 @@ accept(Data, Ref) ->
 
 ack_and_start_child(Data, Sock) ->
   PPid = get_or_start_peer(Data),
+  AllOpts = maps:get(all_options, Data),
+  POpts = maps:get(peer_options, AllOpts, #{}),
+  PeerName = maps:get(name, POpts, peer1),
+  %% check for already started case here
+  {ok, WdPid} = diam_watchdog:start_link(#{name => PeerName, peer_pid => PPid, socket => Sock}),
   {ok, Child} = diam_sctp_child:start_link(Sock, self()),
   diam_sctp_child:give_control(Child, Sock),
   diam_peer:connect_init(PPid, Sock),
-  add_peer(Data, Sock, PPid, Child).
+  add_peer(Data, Sock, PPid, Child, WdPid).
 
 %% ---------------------------------------------------------------------------
 %% Help functions
@@ -239,17 +245,23 @@ new_socket(Data) ->
   set_sctp_sndrcvinfo(Sock, maps:get(sctp_sndrcvinfo, Data, #{})),
   set_sock(Data, Sock).
 
-add_peer(Data, Sock, PPid, Child) ->
+add_peer(Data, Sock, PPid, Child, WdPid) ->
   PProcs = maps:get(peer_procs, Data, #{}),
   Children = maps:get(child_sockets, Data, #{}),
+  WdProcs = maps:get(wd_procs, Data, #{}),
   Data#{
     peer_procs => PProcs#{Sock => PPid},
+    wd_procs => WdProcs#{PPid => WdPid},
     child_sockets => Children#{Sock => Child}
     }.
 
 get_peer(Data, Socket) ->
   PProcs = maps:get(peer_procs, Data),
   maps:get(Socket, PProcs).
+
+get_wd(Peer, Data) ->
+    WdProcs = maps:get(wd_procs, Data),
+    maps:get(Peer, WdProcs).
 
 get_or_start_peer(Data) ->
   case diam_peer:start_link(maps:get(all_options, Data)) of
@@ -299,15 +311,17 @@ set_sctp_sndrcvinfo(Sock, SndRcvInfo) ->
 
 handle_received_msgs(_, []) ->
   ok;
-handle_received_msgs({Peer, Socket}, [Msg|Msgs]) ->
-  case diameter_codec:decode_header(Msg) of
+handle_received_msgs({Peer, Socket, WdPid}, [Msg|Msgs]) ->
+  DiamHead = diameter_codec:decode_header(Msg),
+  diam_watchdog:reset_watchdog_timer(WdPid, DiamHead),
+  case DiamHead of
     false ->
       io:format("Not diameter ~p~n", [Msg]),
       ok;
-    ?IS_APPL_0 = DiamHead ->
+    ?IS_APPL_0 ->
       diam_peer:receive_msg(Peer, Socket, DiamHead, Msg);
-    DiamHead ->
+    _ ->
       %% Callback/other process?
       io:format("Not implemented ~p~n", [DiamHead])
   end,
-  handle_received_msgs({Peer, Socket}, Msgs).
+  handle_received_msgs({Peer, Socket, WdPid}, Msgs).

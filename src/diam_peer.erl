@@ -185,6 +185,8 @@ handle_event(_, {receive_msg, TRef, ?DWR, Bin}, open, Data) ->
 handle_event(_, {send_dwr, TRef}, open, Data) ->
     send_dwr(TRef, Data),
     keep_state_and_data;
+handle_event(_, {send_dwr, _TRef}, _, _Data) ->
+    keep_state_and_data;
 handle_event(_, Event, open, _Data) ->
   io:format("~p:~p:~p ~p~n", [?MODULE, open, ?LINE, Event]),
   keep_state_and_data.

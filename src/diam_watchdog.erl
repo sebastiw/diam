@@ -1,10 +1,14 @@
 -module(diam_watchdog).
+-moduledoc """
+Implementation of state machine defined in RFC-3539
+""".
 
 -behaviour(gen_server).
 
 -export([
-    start_link/1,
-    reset_watchdog_timer/2
+    start/1,
+    reset_watchdog_timer/2,
+    update_state/2
 ]).
 
 -export([
@@ -26,18 +30,23 @@
     tref :: undefined | reference(),
     num_dwa :: integer(),
     peer_pid :: pid(),
-    socket :: pid()
+    socket :: pid(),
+    transport_proc :: pid(),
+    all_options :: map()
 }).
 
 -define(TW_INIT, 30000).
 
-start_link(Config) ->
+start(Config) ->
     PeerName = maps:get(name, Config, ?MODULE),
     WdProc = get_wd_proc_name(PeerName),
-    gen_server:start_link({local, WdProc}, ?MODULE, [Config], []).
+    gen_server:start({local, WdProc}, ?MODULE, [Config], []).
 
 reset_watchdog_timer(WdPid, Header) ->
     gen_server:cast(WdPid, {reset_wd, Header}).
+
+update_state(WdPid, Data) ->
+    gen_server:call(WdPid, {update_state, Data}).
 
 %% gen_server implementations
 
@@ -51,10 +60,21 @@ init([Config]) ->
             tref = TRef,
             num_dwa = 0,
             peer_pid = maps:get(peer_pid, Config),
-            socket = maps:get(socket, Config)
+            socket = maps:get(socket, Config),
+            all_options = maps:get(all_options, Config),
+            transport_proc = maps:get(tproc, Config)
         },
     {ok, State}.
 
+handle_call({update_state, Data}, _From, State) ->
+    NewState =
+        State#state{
+            status = reopen,
+            peer_pid = maps:get(peer_pid, Data),
+            socket = maps:get(socket, Data),
+            transport_proc = maps:get(tproc, Data)
+        },
+    {reply, ok, NewState};
 handle_call(_Msg, _From, State) ->
     {reply, ok, State, State#state.tw}.
 
@@ -70,6 +90,7 @@ handle_cast(_Msg, State) ->
 handle_info(wd_timeout, #state{status = okay, pending = true} = State) ->
     Jitter = calculate_jitter(),
     TRef = timer:send_after(State#state.tw + Jitter, wd_timeout),
+    %failover(),
     {noreply, State#state{status = suspect, tref = TRef}}; 
 handle_info(wd_timeout, #state{status = okay} = State) ->
     send_dwr(State#state.peer_pid, State#state.socket),
@@ -77,12 +98,14 @@ handle_info(wd_timeout, #state{status = okay} = State) ->
     TRef = timer:send_after(State#state.tw + Jitter, wd_timeout),
     {noreply, State#state{tref = TRef, pending = true}}; 
 handle_info(wd_timeout, #state{status = suspect} = State) ->
-    %close_connection(),
+    %close connection
+    diam_sctp:stop(State#state.transport_proc),
     Jitter = calculate_jitter(),
     TRef = timer:send_after(State#state.tw + Jitter, wd_timeout),
     {noreply, State#state{status = down, tref = TRef}};
 handle_info(wd_timeout, #state{status = Status} = State) when Status == initial orelse Status == down ->
-    %attempt_open(),
+    %attempt to open
+    diam_sctp:start_link(State#state.all_options),
     Jitter = calculate_jitter(),
     TRef = timer:send_after(State#state.tw + Jitter, wd_timeout),
     {noreply, State#state{tref = TRef}};
@@ -95,8 +118,9 @@ handle_info(wd_timeout, #state{status = reopen} = State) ->
     case State#state.num_dwa < 0 of
         true ->
             Status = down,
-            NumDwa = State#state.num_dwa;
-            %close_connection();
+            NumDwa = State#state.num_dwa,
+            %close connection
+            diam_sctp:stop(State#state.transport_proc);
         false ->
             Status = State#state.status,
             NumDwa = -1

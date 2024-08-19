@@ -228,8 +228,7 @@ ack_and_start_child(Data, Sock) ->
   AllOpts = maps:get(all_options, Data),
   POpts = maps:get(peer_options, AllOpts, #{}),
   PeerName = maps:get(name, POpts, peer1),
-  %% check for already started case here
-  {ok, WdPid} = diam_watchdog:start_link(#{name => PeerName, peer_pid => PPid, socket => Sock}),
+  WdPid = get_or_start_watchdog(#{name => PeerName, peer_pid => PPid, socket => Sock, all_options => AllOpts, tproc => self()}),
   {ok, Child} = diam_sctp_child:start_link(Sock, self()),
   diam_sctp_child:give_control(Child, Sock),
   diam_peer:connect_init(PPid, Sock),
@@ -269,6 +268,15 @@ get_or_start_peer(Data) ->
       PPid;
     {error, {already_started, PPId}} ->
       PPId
+  end.
+
+get_or_start_watchdog(Data) ->
+  case diam_watchdog:start(Data) of
+    {ok, WdPid} ->
+      WdPid;
+    {error, {already_started, WdPid}} ->
+      ok = diam_watchdog:update_state(WdPid, Data),
+      WdPid
   end.
 
 set_sock(Data, Sock) ->

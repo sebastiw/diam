@@ -10,7 +10,8 @@ Diameter Peer State Machine
          connect_init/2,
          connect_fail/3,
          receive_msg/4,
-         send_dwr_msg/2
+         send_dwr_msg/2,
+         stop/1
         ]).
 
 -export([callback_mode/0,
@@ -50,6 +51,9 @@ receive_msg(PProc, TRef, Header, Bin) ->
 
 send_dwr_msg(PProc, TRef) ->
     gen_statem:cast(PProc, {send_dwr, TRef}).
+
+stop(PProc) ->
+    gen_statem:stop(PProc).
 
 %% ---------------------------------------------------------------------------
 %% State machine
@@ -136,8 +140,7 @@ handle_event({timeout, capability_exchange}, {retry, TRef}, wait_for_ce, #{mode 
   NewData = add_connecting_peer(Data, TRef),
   {keep_state, NewData, [{{timeout, capability_exchange}, ?CAPABILITY_TIMER, {retry, TRef}}]};
 
-%% ----- open -----
-handle_event(_, {connect_fail, TRef, _Reason}, open, Data) ->
+handle_event(_, {connect_fail, TRef, _Reason}, _State, Data) ->
   NewData = remove_peer(Data, TRef),
   case {maps:get(active_peers, NewData, []), maps:get(connecting_peers, NewData, [])} of
     {[], []} ->
@@ -147,6 +150,8 @@ handle_event(_, {connect_fail, TRef, _Reason}, open, Data) ->
     {_, _} ->
       {keep_state, NewData}
   end;
+
+%% ----- open -----
 handle_event(_, {connect_init, TRef}, open, #{mode := client} = Data) ->
   send_cer(TRef, Data),
   NewData = add_connecting_peer(Data, TRef),

@@ -196,6 +196,8 @@ handle_event(info, {'$socket', LSock, select, Ref}, open, #{socket := LSock} = D
       {keep_state, NewData#{accept_tref => TRef}}
   end;
 handle_event(info, {'$socket', Sock, abort, {_Ref, cancelled}}, open, #{socket := Sock} = Data) ->
+  {keep_state, Data};
+handle_event(EventType, EventContent, State, Data) ->
   {keep_state, Data}.
 
 terminate(_Why, _State, Data) ->
@@ -275,7 +277,7 @@ get_or_start_watchdog(Data) ->
     {ok, WdPid} ->
       WdPid;
     {error, {already_started, WdPid}} ->
-      ok = diam_watchdog:update_state(WdPid, Data),
+      diam_watchdog:update_state(WdPid, Data),
       WdPid
   end.
 

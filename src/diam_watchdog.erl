@@ -46,12 +46,12 @@ reset_watchdog_timer(WdPid, Header) ->
     gen_server:cast(WdPid, {reset_wd, Header}).
 
 update_state(WdPid, Data) ->
-    gen_server:call(WdPid, {update_state, Data}).
+    gen_server:cast(WdPid, {update_state, Data}).
 
 %% gen_server implementations
 
 init([Config]) ->
-    TRef = timer:send_after(?TW_INIT, wd_timeout),
+    {ok, TRef} = timer:send_after(?TW_INIT, wd_timeout),
     State =
         #state{
             status = okay,
@@ -66,18 +66,20 @@ init([Config]) ->
         },
     {ok, State}.
 
-handle_call({update_state, Data}, _From, State) ->
+handle_call(_Msg, _From, State) ->
+    {reply, ok, State}.
+
+handle_cast({update_state, Data}, State) ->
     NewState =
         State#state{
             status = reopen,
+            num_dwa = 0,
+            pending = false,
             peer_pid = maps:get(peer_pid, Data),
             socket = maps:get(socket, Data),
             transport_proc = maps:get(tproc, Data)
         },
-    {reply, ok, NewState};
-handle_call(_Msg, _From, State) ->
-    {reply, ok, State, State#state.tw}.
-
+    {noreply, NewState};
 handle_cast({reset_wd, ?DWA}, State) ->
     NewState = handle_dwa(State),
     {noreply, NewState#state{pending = false}};
@@ -88,31 +90,27 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info(wd_timeout, #state{status = okay, pending = true} = State) ->
-    Jitter = calculate_jitter(),
-    TRef = timer:send_after(State#state.tw + Jitter, wd_timeout),
+    TRef = reset_timer(State#state.tw),
     %failover(),
     {noreply, State#state{status = suspect, tref = TRef}}; 
 handle_info(wd_timeout, #state{status = okay} = State) ->
     send_dwr(State#state.peer_pid, State#state.socket),
-    Jitter = calculate_jitter(),
-    TRef = timer:send_after(State#state.tw + Jitter, wd_timeout),
+    TRef = reset_timer(State#state.tw),
     {noreply, State#state{tref = TRef, pending = true}}; 
 handle_info(wd_timeout, #state{status = suspect} = State) ->
     %close connection
+    %diam_peer:stop(State#state.peer_pid),
     diam_sctp:stop(State#state.transport_proc),
-    Jitter = calculate_jitter(),
-    TRef = timer:send_after(State#state.tw + Jitter, wd_timeout),
+    TRef = reset_timer(State#state.tw),
     {noreply, State#state{status = down, tref = TRef}};
 handle_info(wd_timeout, #state{status = Status} = State) when Status == initial orelse Status == down ->
     %attempt to open
     diam_sctp:start_link(State#state.all_options),
-    Jitter = calculate_jitter(),
-    TRef = timer:send_after(State#state.tw + Jitter, wd_timeout),
+    TRef = reset_timer(State#state.tw),
     {noreply, State#state{tref = TRef}};
 handle_info(wd_timeout, #state{status = reopen, pending = false} = State) ->
     send_dwr(State#state.peer_pid, State#state.socket),
-    Jitter = calculate_jitter(),
-    TRef = timer:send_after(State#state.tw + Jitter, wd_timeout),
+    TRef = reset_timer(State#state.tw),
     {noreply, State#state{pending = true, tref = TRef}};
 handle_info(wd_timeout, #state{status = reopen} = State) ->
     case State#state.num_dwa < 0 of
@@ -125,8 +123,7 @@ handle_info(wd_timeout, #state{status = reopen} = State) ->
             Status = State#state.status,
             NumDwa = -1
     end,
-    Jitter = calculate_jitter(),
-    TRef = timer:send_after(State#state.tw + Jitter, wd_timeout),
+    TRef = reset_timer(State#state.tw),
     {noreply, State#state{tref = TRef, status = Status, num_dwa = NumDwa}};
 handle_info(wd_timeout, State) ->
     {noreply, State};
@@ -156,13 +153,17 @@ handle_dwa(#state{status = reopen, num_dwa = NumDwa} = State) ->
 handle_dwa(State) ->
     State.
 
-reset_timer(TRef, Tw) ->
-    timer:cancel(TRef),
-    Jitter = calculate_jitter(),
-    timer:send_after(Tw + Jitter, wd_timeout).
-
 calculate_jitter() ->
     (rand:uniform(5) -3) * 1000.   
+
+reset_timer(Tw) ->
+    Jitter = calculate_jitter(),
+    {ok, TRef} = timer:send_after(Tw + Jitter, wd_timeout),
+    TRef.
+
+reset_timer(TRef, Tw) ->
+    timer:cancel(TRef),
+    reset_timer(Tw).
 
 send_dwr(PeerPid, Socket) ->
     diam_peer:send_dwr_msg(PeerPid, Socket).

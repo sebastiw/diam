@@ -9,7 +9,9 @@ Diameter Peer State Machine
          start_link/2,
          connect_init/2,
          connect_fail/3,
-         receive_msg/4
+         receive_msg/4,
+         send_dwr_msg/2,
+         stop/1
         ]).
 
 -export([callback_mode/0,
@@ -19,8 +21,7 @@ Diameter Peer State Machine
         ]).
 
 -include_lib("diameter/include/diameter.hrl").
--define(CER, #diameter_header{version = 1, application_id = 0, cmd_code = 257, is_request = true}).
--define(CEA, #diameter_header{version = 1, application_id = 0, cmd_code = 257, is_request = false}).
+-include_lib("diam/include/diam.hrl").
 
 -define(CAPABILITY_TIMER, timer:seconds(5)).
 
@@ -47,6 +48,12 @@ connect_fail(PProc, TRef, Reason) ->
 receive_msg(PProc, TRef, Header, Bin) ->
   io:format("~p:~p:~p<->~p (~p)~n", [?MODULE, ?FUNCTION_NAME, PProc, TRef, Header]),
   gen_statem:cast(PProc, {receive_msg, TRef, Header, Bin}).
+
+send_dwr_msg(PProc, TRef) ->
+    gen_statem:cast(PProc, {send_dwr, TRef}).
+
+stop(PProc) ->
+    gen_statem:stop(PProc).
 
 %% ---------------------------------------------------------------------------
 %% State machine
@@ -99,7 +106,7 @@ handle_event(_, {connect_fail, TRef, _Reason}, closed, Data) ->
 
 %% ----- wait_for_ce -----
 handle_event(_, {receive_msg, TRef, ?CER, Bin}, wait_for_ce, #{mode := server} = Data) ->
-  case test_cer(Data, Bin) of
+  case test_req(Data, Bin, ?CER) of
     {true, CER} ->
       send_cea(TRef, Data, 2001),
       NewData = add_active_peer(Data, TRef, CER),
@@ -109,7 +116,7 @@ handle_event(_, {receive_msg, TRef, ?CER, Bin}, wait_for_ce, #{mode := server} =
       {keep_state_and_data, [{{timeout, capability_exchange}, ?CAPABILITY_TIMER, {retry, TRef}}]}
   end;
 handle_event(_, {receive_msg, TRef, ?CEA, Bin}, wait_for_ce, #{mode := client} = Data) ->
-  case test_cea(Data, Bin) of
+  case test_res(Data, Bin, ?CEA) of
     {true, CEA} ->
       NewData = add_active_peer(Data, TRef, CEA),
       {next_state, open, NewData, [{{timeout, capability_exchange}, cancel}]};
@@ -133,8 +140,7 @@ handle_event({timeout, capability_exchange}, {retry, TRef}, wait_for_ce, #{mode 
   NewData = add_connecting_peer(Data, TRef),
   {keep_state, NewData, [{{timeout, capability_exchange}, ?CAPABILITY_TIMER, {retry, TRef}}]};
 
-%% ----- open -----
-handle_event(_, {connect_fail, TRef, _Reason}, open, Data) ->
+handle_event(_, {connect_fail, TRef, _Reason}, _State, Data) ->
   NewData = remove_peer(Data, TRef),
   case {maps:get(active_peers, NewData, []), maps:get(connecting_peers, NewData, [])} of
     {[], []} ->
@@ -144,6 +150,8 @@ handle_event(_, {connect_fail, TRef, _Reason}, open, Data) ->
     {_, _} ->
       {keep_state, NewData}
   end;
+
+%% ----- open -----
 handle_event(_, {connect_init, TRef}, open, #{mode := client} = Data) ->
   send_cer(TRef, Data),
   NewData = add_connecting_peer(Data, TRef),
@@ -152,7 +160,7 @@ handle_event(_, {connect_init, TRef}, open, #{mode := server} = Data) ->
   NewData = add_connecting_peer(Data, TRef),
   {keep_state, NewData};
 handle_event(_, {receive_msg, TRef, ?CER, Bin}, open, #{mode := server} = Data) ->
-  case test_cer(Data, Bin) of
+  case test_req(Data, Bin, ?CER) of
     {true, CER} ->
       send_cea(TRef, Data, 2001),
       NewData = add_active_peer(Data, TRef, CER),
@@ -162,7 +170,7 @@ handle_event(_, {receive_msg, TRef, ?CER, Bin}, open, #{mode := server} = Data) 
       keep_state_and_data
   end;
 handle_event(_, {receive_msg, TRef, ?CEA, Bin}, open, #{mode := client} = Data) ->
-  case test_cea(Data, Bin) of
+  case test_res(Data, Bin, ?CEA) of
     {true, CEA} ->
       NewData = add_active_peer(Data, TRef, CEA),
       {keep_state, open, NewData};
@@ -170,6 +178,20 @@ handle_event(_, {receive_msg, TRef, ?CEA, Bin}, open, #{mode := client} = Data) 
       io:format("~p:~p:~p nomatch ~p~n", [?MODULE, ?FUNCTION_NAME, ?LINE, CEA]),
       keep_state_and_data
   end;
+handle_event(_, {receive_msg, TRef, ?DWR, Bin}, open, Data) ->
+  case test_req(Data, Bin, ?DWR) of
+    {true, _} ->
+      send_dwa(TRef, Data, 2001),
+      keep_state_and_data;
+    {false, _} ->
+      send_dwa(TRef, Data, 3003),
+      keep_state_and_data
+  end;
+handle_event(_, {send_dwr, TRef}, open, Data) ->
+    send_dwr(TRef, Data),
+    keep_state_and_data;
+handle_event(_, {send_dwr, _TRef}, _, _Data) ->
+    keep_state_and_data;
 handle_event(_, Event, open, _Data) ->
   io:format("~p:~p:~p ~p~n", [?MODULE, open, ?LINE, Event]),
   keep_state_and_data.
@@ -199,30 +221,45 @@ send_cea(TRef, Data, ResultCode) ->
   E2E = maps:get(e2e, Data),
   diam_sctp:send_msg(TProc, TRef, diam_msgs:cea(Host, Realm, HBH, E2E, LocalIPs, ResultCode)).
 
+send_dwr(TRef, Data) ->
+  TProc = maps:get(transport_proc, Data),
+  Host = maps:get(local_host, Data),
+  Realm = maps:get(local_realm, Data),
+  HBH = maps:get(hbh, Data),
+  E2E = maps:get(e2e, Data),
+  diam_sctp:send_msg(TProc, TRef, diam_msgs:dwr(Host, Realm, HBH, E2E)).
+
+send_dwa(TRef, Data, ResultCode) ->
+  TProc = maps:get(transport_proc, Data),
+  Host = maps:get(local_host, Data),
+  Realm = maps:get(local_realm, Data),
+  HBH = maps:get(hbh, Data),
+  E2E = maps:get(e2e, Data),
+  diam_sctp:send_msg(TProc, TRef, diam_msgs:dwa(Host, Realm, HBH, E2E, ResultCode)).
 %% ---------------------------------------------------------------------------
 %% Help functions
 %% ---------------------------------------------------------------------------
 
-test_cer(Data, Bin) ->
-  CER = diam_msgs:decode(?CER, Bin),
+test_req(Data, Bin, Header) ->
+  Req = diam_msgs:decode(Header, Bin),
   OHPat = maps:get(allowed_host_pattern, Data),
   ORPat = maps:get(allowed_realm_pattern, Data),
-  [{true, OH}] = maps:get('Origin-Host', CER),
-  [{true, OR}] = maps:get('Origin-Realm', CER),
+  [{true, OH}] = maps:get('Origin-Host', Req),
+  [{true, OR}] = maps:get('Origin-Realm', Req),
   MOH = re:run(OH, OHPat, [{capture, none}]),
   MOR = re:run(OR, ORPat, [{capture, none}]),
-  {match == MOH andalso match == MOR, CER}.
+  {match == MOH andalso match == MOR, Req}.
 
-test_cea(Data, Bin) ->
-  CEA = diam_msgs:decode(?CEA, Bin),
+test_res(Data, Bin, Header) ->
+  Res = diam_msgs:decode(Header, Bin),
   OHPat = maps:get(allowed_host_pattern, Data),
   ORPat = maps:get(allowed_realm_pattern, Data),
-  [{true, OH}] = maps:get('Origin-Host', CEA),
-  [{true, OR}] = maps:get('Origin-Realm', CEA),
+  [{true, OH}] = maps:get('Origin-Host', Res),
+  [{true, OR}] = maps:get('Origin-Realm', Res),
   MOH = re:run(OH, OHPat, [{capture, none}]),
   MOR = re:run(OR, ORPat, [{capture, none}]),
-  [{true, <<ResultCode:32>>}] = maps:get('Result-Code', CEA),
-  {2001 =:= ResultCode andalso match == MOH andalso match == MOR, CEA}.
+  [{true, <<ResultCode:32>>}] = maps:get('Result-Code', Res),
+  {2001 =:= ResultCode andalso match == MOH andalso match == MOR, Res}.
 
 remove_peer(Data0, TRef) ->
   Data1 = maps:update_with(active_peers, fun (APs) -> lists:keydelete(TRef, 1, APs) end, [], Data0),

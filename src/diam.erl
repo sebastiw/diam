@@ -1,7 +1,11 @@
 -module(diam).
 
 -export([start_server/0,
-         start_client/0
+         start_client/0,
+         stop_server/0,
+         stop_client/0,
+         send_server/1,
+         send_client/1
         ]).
 
 start_server() ->
@@ -17,6 +21,12 @@ start_client() ->
     peer_options => #{name => peer_client, mode => client, local_host => <<"peer.client.se">>, local_realm => <<"client.se">>}
     },
   diam_sctp:start_link(normalize_config(Opts)).
+
+stop_server() ->
+    diam_sctp:stop(transport_server).
+
+stop_client() ->
+    diam_sctp:stop(transport_client).
 
 send_server(Msg) ->
   diam_sctp:send_msg(transport_server, Msg).

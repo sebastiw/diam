@@ -37,15 +37,12 @@ start_link(PeerName, Opts) ->
   gen_statem:start_link({local, PeerName}, ?MODULE, Opts#{transport_proc => TProc}, []).
 
 connect_init(PProc, TRef) ->
-  io:format("~p:~p:~p<->~p~n", [?MODULE, ?FUNCTION_NAME, PProc, TRef]),
   gen_statem:cast(PProc, {connect_init, TRef}).
 
 connect_fail(PProc, TRef, Reason) ->
-  io:format("~p:~p:~p<->~p (~p)~n", [?MODULE, ?FUNCTION_NAME, PProc, TRef, Reason]),
   gen_statem:cast(PProc, {connect_fail, TRef, Reason}).
 
 receive_msg(PProc, TRef, Header, Bin) ->
-  io:format("~p:~p:~p<->~p (~p)~n", [?MODULE, ?FUNCTION_NAME, PProc, TRef, Header]),
   gen_statem:cast(PProc, {receive_msg, TRef, Header, Bin}).
 
 %% ---------------------------------------------------------------------------

@@ -58,7 +58,7 @@ send_msg(SProc, Socket, Msg) ->
   gen_statem:cast(SProc, {send_msg, Socket, Msg}).
 
 stop(SProc) ->
-  gen_statem:stop(SProc).
+  gen_statem:stop(SProc, normal, 5_000).
 
 %% ---------------------------------------------------------------------------
 %% State machine
@@ -127,10 +127,17 @@ handle_event({timeout, connect}, _Info, connect, _Data) ->
 handle_event(_, start, listen, Data) ->
   case accept(Data, ?CONNECT_TIMEOUT) of
     {ok, Sock1} ->
-      %% remote_ip_addresses && allowed_ip_subnet check
-      NewData = ack_and_start_child(Data, Sock1),
-      {ok, TRef} = timer:send_after(?CONNECT_TIMEOUT, {accept_timeout, nowait}),
-      {next_state, open, NewData#{accept_tref => TRef}};
+      RIPs = maps:get(remote_ip_addresses, Data),
+      AllowedSubnet = maps:get(allowed_ip_subnet, Data),
+      case allowed_ip(RIPs, AllowedSubnet) of
+          true ->
+              NewData = ack_and_start_child(Data, Sock1),
+              {ok, TRef} = timer:send_after(?CONNECT_TIMEOUT, {accept_timeout, nowait}),
+              {next_state, open, NewData#{accept_tref => TRef}};
+          false ->
+              socket:close(Sock1),
+              {keep_state_and_data, [{next_event, internal, start}]}
+      end;
     {error, timeout} ->
       io:format("~p:~p:~p~n", [?MODULE, accept_timeout, self()]),
       {keep_state_and_data, [{next_event, internal, start}]};
@@ -175,9 +182,18 @@ handle_event(info, {accept_timeout, Select}, open, Data) ->
   {ok, cancel} = timer:cancel(maps:get(accept_tref, Data)),
   case accept(Data, Select) of
     {ok, Sock1} ->
-      NewData = ack_and_start_child(Data, Sock1),
-      {ok, TRef} = timer:send_after(?CONNECT_TIMEOUT, {accept_timeout, nowait}),
-      {keep_state, NewData#{accept_tref => TRef}};
+      RIPs = maps:get(remote_ip_addresses, Data),
+      AllowedSubnet = maps:get(allowed_ip_subnet, Data),
+      case allowed_ip(RIPs, AllowedSubnet) of
+          true ->
+              NewData = ack_and_start_child(Data, Sock1),
+              {ok, TRef} = timer:send_after(?CONNECT_TIMEOUT, {accept_timeout, nowait}),
+              {keep_state, NewData#{accept_tref => TRef}};
+          false ->
+              socket:close(Sock1),
+              {ok, TRef} = timer:send_after(?CONNECT_TIMEOUT, {accept_timeout, nowait}),
+              {keep_state, Data#{accept_tref => TRef}}
+      end;
     {select, {select_info, accept, SelectInfo}} ->
       {ok, TRef} = timer:send_after(?CONNECT_TIMEOUT, {accept_timeout, SelectInfo}),
       {keep_state, Data#{accept_tref => TRef}};
@@ -311,3 +327,15 @@ handle_received_msgs({Peer, Socket}, [Msg|Msgs]) ->
       io:format("Not implemented ~p~n", [DiamHead])
   end,
   handle_received_msgs({Peer, Socket}, Msgs).
+
+allowed_ip([], _) ->
+  false;
+allowed_ip([IP|IPs], Subnet) ->
+  [RP, BL] = string:split(Subnet, "/"),
+  BitLength = binary_to_integer(BL),
+  RPParts = string:split(RP, ".", all),
+  IPParts = string:split(IP, ".", all),
+  <<RPRaw:32>> = <<<<(binary_to_integer(A))>> || A <- RPParts>>,
+  <<IPRaw:32>> = <<<<(binary_to_integer(A))>> || A <- IPParts>>,
+  Mask = ((1 bsl 32) - 1) bxor ((1 bsl (32-BitLength)) - 1),
+  (RPRaw band Mask) == (IPRaw band Mask).
